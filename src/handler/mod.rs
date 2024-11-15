@@ -1,42 +1,101 @@
-// src/handler/mod.rs
-
-use std::{collections::HashMap, sync::Arc, time::Duration};
 use serenity::{
     async_trait,
     model::{
         gateway::Ready,
         voice::VoiceState,
-        id::{ChannelId, UserId},
-        channel::PermissionOverwrite,
-        permissions::{Permissions, PermissionOverwriteType},
+        id::{ChannelId, GuildId, UserId},
+        channel::{Channel, ChannelType, PermissionOverwrite},
+        guild::Member,
+        permissions::Permissions,
+        prelude::PermissionOverwriteType,
     },
     prelude::*,
 };
 use tokio::{sync::RwLock, time::sleep};
 use tracing::{error, info, warn};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-// Structuur voor de informatie over een tijdelijk kanaal
 #[derive(Debug)]
 pub struct ChannelInfo {
     owner_id: UserId,
     delete_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-// De hoofdstructuur voor de bot handler
 pub struct Handler {
     temp_channels: Arc<RwLock<HashMap<ChannelId, ChannelInfo>>>,
     creator_channel_id: ChannelId,
+    waiting_room_id: ChannelId,
 }
 
 impl Handler {
-    pub fn new(creator_channel_id: ChannelId) -> Self {
+    pub fn new(creator_channel_id: ChannelId, waiting_room_id: ChannelId) -> Self {
         Self {
             temp_channels: Arc::new(RwLock::new(HashMap::new())),
             creator_channel_id,
+            waiting_room_id,
         }
     }
 
-    // Functie om een tijdelijk kanaal aan te maken
+    async fn user_has_channel(&self, user_id: UserId) -> bool {
+        let temp_channels = self.temp_channels.read().await;
+        temp_channels.values().any(|info| info.owner_id == user_id)
+    }
+
+    async fn get_user_channel(&self, user_id: UserId) -> Option<ChannelId> {
+        let temp_channels = self.temp_channels.read().await;
+        temp_channels
+            .iter()
+            .find(|(_, info)| info.owner_id == user_id)
+            .map(|(channel_id, _)| *channel_id)
+    }
+
+    async fn handle_creator_channel_join(
+        &self,
+        ctx: &Context,
+        guild_id: GuildId,
+        member: &Member,
+        parent_id: Option<ChannelId>,
+    ) -> Result<(), SerenityError> {
+        // First, remove existing channel if it exists
+        if self.user_has_channel(member.user.id).await {
+            if let Some(existing_channel) = self.get_user_channel(member.user.id).await {
+                // Delete the existing channel
+                if let Err(e) = existing_channel.delete(&ctx.http).await {
+                    error!("Error deleting existing channel: {:?}", e);
+                } else {
+                    info!("Successfully deleted existing channel");
+                    // Remove from tracking
+                    let mut temp_channels = self.temp_channels.write().await;
+                    temp_channels.remove(&existing_channel);
+                }
+            }
+        }
+
+        // Create a new channel
+        match self.create_temp_channel(ctx, guild_id, member, parent_id).await {
+            Ok(Channel::Guild(guild_channel)) => {
+                {
+                    let mut temp_channels = self.temp_channels.write().await;
+                    temp_channels.insert(
+                        guild_channel.id,
+                        ChannelInfo {
+                            owner_id: member.user.id,
+                            delete_task: None,
+                        },
+                    );
+                }
+
+                if let Err(e) = member.move_to_voice_channel(&ctx.http, guild_channel.id).await {
+                    error!("Error moving user: {:?}", e);
+                } else {
+                    info!("✓ User moved to new channel");
+                }
+            }
+            _ => error!("Unexpected channel type created"),
+        }
+        Ok(())
+    }
+
     async fn create_temp_channel(
         &self,
         ctx: &Context,
@@ -44,30 +103,35 @@ impl Handler {
         member: &Member,
         parent_id: Option<ChannelId>,
     ) -> Result<Channel, SerenityError> {
-        let channel_name = format!("{}'s Channel", member.display_name());
+        let channel_name = if let Some(guild) = guild_id.to_guild_cached(&ctx.cache) {
+            if let Some(member_info) = guild.member(&ctx.http, member.user.id).await.ok() {
+                member_info.display_name().to_string()
+            } else {
+                member.user.name.clone()
+            }
+        } else {
+            member.user.name.clone()
+        };
         let bot_id = ctx.cache.current_user_id();
+        let waiting_room_id = self.waiting_room_id;
 
-        let channel = guild_id.create_channel(&ctx.http, |c| {
-            c.name(&channel_name)
+        let guild_channel = guild_id.create_channel(&ctx.http, |c| {
+            let mut channel = c.name(&channel_name)
                 .kind(ChannelType::Voice)
                 .permissions(vec![
-                    // Standaard deny voor @everyone
                     PermissionOverwrite {
                         kind: PermissionOverwriteType::Role(guild_id.0.into()),
                         allow: Permissions::empty(),
-                        deny: Permissions::CONNECT,
+                        deny: Permissions::CONNECT | Permissions::MOVE_MEMBERS,
                     },
-                    // Allow voor kanaal eigenaar
                     PermissionOverwrite {
                         kind: PermissionOverwriteType::Member(member.user.id),
-                        allow: Permissions::CONNECT
-                            | Permissions::MOVE_MEMBERS
+                        allow: Permissions::CONNECT 
                             | Permissions::MANAGE_CHANNELS
                             | Permissions::MUTE_MEMBERS
                             | Permissions::DEAFEN_MEMBERS,
                         deny: Permissions::empty(),
                     },
-                    // Allow voor bot
                     PermissionOverwrite {
                         kind: PermissionOverwriteType::Member(bot_id),
                         allow: Permissions::CONNECT
@@ -77,19 +141,26 @@ impl Handler {
                     },
                 ]);
 
-            // Als er een parent category is, zet het kanaal in die category
             if let Some(parent) = parent_id {
-                c.parent_id(parent);
+                channel = channel.category(parent);
             }
-            c
+            channel
         })
         .await?;
 
-        info!("✓ Kanaal aangemaakt: {}", channel_name);
-        Ok(channel)
+        waiting_room_id.create_permission(
+            &ctx.http,
+            &PermissionOverwrite {
+                kind: PermissionOverwriteType::Member(member.user.id),
+                allow: Permissions::MOVE_MEMBERS,
+                deny: Permissions::empty(),
+            },
+        ).await?;
+
+        info!("✓ Kanaal aangemaakt: {} met beperkte move permissions", channel_name);
+        Ok(Channel::Guild(guild_channel))
     }
 
-    // Functie om een verwijdertaak voor een kanaal aan te maken
     async fn schedule_channel_deletion(
         &self,
         ctx: Context,
@@ -115,15 +186,12 @@ impl Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    // Event handler voor als de bot opstart
     async fn ready(&self, _: Context, ready: Ready) {
         info!("Bot is online als {}!", ready.user.name);
         info!("Watching creator channel ID: {}", self.creator_channel_id);
     }
 
-    // Event handler voor voice state updates
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
-        // Gebruiker joint creator kanaal
         if let Some(channel_id) = new.channel_id {
             if channel_id == self.creator_channel_id {
                 let guild_id = match new.guild_id {
@@ -131,7 +199,6 @@ impl EventHandler for Handler {
                     None => return,
                 };
 
-                // Check permissions
                 let guild = match guild_id.to_guild_cached(&ctx.cache) {
                     Some(g) => g,
                     None => {
@@ -157,47 +224,26 @@ impl EventHandler for Handler {
                     return;
                 }
 
-                // Maak nieuw kanaal
                 let member = match new.member {
                     Some(ref m) => m,
                     None => return,
                 };
 
-                let parent_id = new
-                    .channel_id
-                    .to_channel_cached(&ctx.cache)
-                    .and_then(|c| c.parent_id);
+                let channel = new.channel_id
+                    .expect("Channel ID should exist")
+                    .to_channel_cached(&ctx.cache);
 
-                match self
-                    .create_temp_channel(&ctx, guild_id, member, parent_id)
-                    .await
-                {
-                    Ok(channel) => {
-                        // Voeg kanaal toe aan temp_channels
-                        {
-                            let mut temp_channels = self.temp_channels.write().await;
-                            temp_channels.insert(
-                                channel.id,
-                                ChannelInfo {
-                                    owner_id: member.user.id,
-                                    delete_task: None,
-                                },
-                            );
-                        }
+                let parent_id = channel.and_then(|c| match c {
+                    Channel::Guild(gc) => gc.parent_id,
+                    _ => None,
+                });
 
-                        // Verplaats gebruiker
-                        if let Err(e) = member.move_to_voice_channel(&ctx.http, channel.id).await {
-                            error!("Error bij verplaatsen gebruiker: {:?}", e);
-                        } else {
-                            info!("✓ Gebruiker verplaatst naar nieuw kanaal");
-                        }
-                    }
-                    Err(e) => error!("Fout bij aanmaken kanaal: {:?}", e),
+                if let Err(e) = self.handle_creator_channel_join(&ctx, guild_id, member, parent_id).await {
+                    error!("Error handling creator channel join: {:?}", e);
                 }
             }
         }
 
-        // Gebruiker verlaat een kanaal
         if let Some(old_state) = old {
             if let Some(old_channel_id) = old_state.channel_id {
                 let mut temp_channels = self.temp_channels.write().await;
@@ -211,44 +257,49 @@ impl EventHandler for Handler {
                         None => return,
                     };
 
-                    let channel = match guild.channels.get(&old_channel_id) {
-                        Some(c) => c,
+                    match guild.channels.get(&old_channel_id) {
+                        Some(channel) => {
+                            match channel {
+                                Channel::Guild(gc) => {
+                                    match gc.members(&ctx).await {
+                                        Ok(members) => {
+                                            if members.is_empty() {
+                                                info!(
+                                                    "Kanaal {} is leeg, wordt over 5 seconden verwijderd",
+                                                    gc.name
+                                                );
+
+                                                if let Some(task) = channel_info.delete_task.take() {
+                                                    task.abort();
+                                                }
+
+                                                let delete_task = self
+                                                    .schedule_channel_deletion(
+                                                        ctx.clone(),
+                                                        old_channel_id,
+                                                        gc.name.clone(),
+                                                    )
+                                                    .await;
+
+                                                channel_info.delete_task = Some(delete_task);
+                                            }
+                                        },
+                                        Err(e) => error!("Fout bij ophalen kanaal members: {:?}", e),
+                                    }
+                                },
+                                _ => warn!("Channel is not a guild channel"),
+                            }
+                        }
                         None => return,
                     };
-
-                    // Check of het kanaal leeg is
-                    if channel.members(&ctx.cache).count() == 0 {
-                        info!(
-                            "Kanaal {} is leeg, wordt over 5 seconden verwijderd",
-                            channel.name()
-                        );
-
-                        // Cancel bestaande delete task als die er is
-                        if let Some(task) = channel_info.delete_task.take() {
-                            task.abort();
-                        }
-
-                        // Start nieuwe delete task
-                        let delete_task = self
-                            .schedule_channel_deletion(
-                                ctx.clone(),
-                                old_channel_id,
-                                channel.name().to_string(),
-                            )
-                            .await;
-
-                        channel_info.delete_task = Some(delete_task);
-                    }
                 }
             }
         }
 
-        // Gebruiker joint een bestaand tijdelijk kanaal
         if let Some(new_channel_id) = new.channel_id {
             let mut temp_channels = self.temp_channels.write().await;
 
             if let Some(channel_info) = temp_channels.get_mut(&new_channel_id) {
-                // Cancel verwijdertaak als die bestaat
                 if let Some(task) = channel_info.delete_task.take() {
                     task.abort();
                     info!("Verwijdering van kanaal geannuleerd omdat er iemand gejoind is");

@@ -4,6 +4,7 @@ mod utils;
 
 use std::env;
 use serenity::prelude::*;
+use serenity::model::prelude::ChannelId;
 use dotenv::dotenv;
 use handler::Handler;
 
@@ -19,10 +20,17 @@ async fn main() {
     let token = env::var("DISCORD_TOKEN")
         .expect("Token niet gevonden");
     
-    // Get creator channel ID
+    // Get channel IDs
     let creator_channel_id = ChannelId(
         env::var("CREATOR_CHANNEL_ID")
             .expect("Creator channel ID niet gevonden")
+            .parse()
+            .expect("Invalid channel ID")
+    );
+
+    let waiting_room_id = ChannelId(
+        env::var("WAITING_ROOM_ID")
+            .expect("Waiting room ID niet gevonden")
             .parse()
             .expect("Invalid channel ID")
     );
@@ -33,7 +41,7 @@ async fn main() {
 
     // Create client
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler::new(creator_channel_id))
+        .event_handler(Handler::new(creator_channel_id, waiting_room_id))
         .await
         .expect("Error bij maken client");
 
